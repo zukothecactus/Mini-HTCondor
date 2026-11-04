@@ -1,0 +1,22 @@
+[project]
+name = "mini-htcondor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "zukothecactus", email = "obrenovic036.exe@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "docker>=7.2.0",
+    "fastapi>=0.162.0",
+    "requests>=2.34.2",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+mini-htcondor = "mini_htcondor:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
