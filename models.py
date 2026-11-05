@@ -1,6 +1,6 @@
 from enum import Enum
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone
 
@@ -18,7 +18,6 @@ class WorkerStatus(str, Enum):
     BUSY = "BUSY"
     DEAD = "DEAD"
     
-    
 #models
 class Job(BaseModel):
     job_id:str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -34,6 +33,12 @@ class Job(BaseModel):
     #for the lease
     retry_count: int = 0
     max_retries: int = 3    
+    
+    #for ClassAd matching
+    #an expression instead of our hardcoded logic
+    requirements:str = "worker.offered_cpus_available >= job.required_cpus and worker.offered_ram_available >= job.required_ram"
+    custom_attributes: Dict[str, Any] = Field(default_factory=dict) #for any additional attributes that the user wants to add to the job
+    
     
     #execution results
     exit_code: Optional[int] = None
@@ -52,9 +57,18 @@ class Worker(BaseModel):
     offered_ram_total: int = 8192 #8gb
     offered_ram_available: int = 8192
     
+    #ClassAd attributes
+    custom_attributes: Dict[str, Any] = Field(default_factory=dict) #for any additional attributes that the user wants to add to the worker
+    
 #request models
 class JobUpdateRequest(BaseModel):
     status: JobStatus
     exit_code: Optional[int] = None
     stdout: Optional[str] = None
     stderr: Optional[str] = None  
+    
+class HeartbeatRequest(BaseModel):
+    status: WorkerStatus
+    offered_cpus: float = 4.0
+    offered_ram: int = 8192
+    custom_attributes: Dict[str, Any] = Field(default_factory=dict)
