@@ -1,6 +1,6 @@
 from enum import Enum
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uuid
 from datetime import datetime, timezone
 
@@ -12,7 +12,6 @@ class JobStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     HELD = "HELD" #if a job exceeds the max_retries
-
 class WorkerStatus(str, Enum):
     IDLE = "IDLE"
     BUSY = "BUSY"
@@ -39,12 +38,24 @@ class Job(BaseModel):
     requirements:str = "worker.offered_cpus_available >= job.required_cpus and worker.offered_ram_available >= job.required_ram"
     custom_attributes: Dict[str, Any] = Field(default_factory=dict) #for any additional attributes that the user wants to add to the job
     
+    #file sandboxing flags
+    has_input_sandbox: bool = False
+    has_output_sandbox: bool = False
+    
+    #Mini-DAGMan: list of parent job_ids that must be completed before this job can run
+    #DAGMan: Directed Acyclic Graph Manager, a meta-scheduler for HTCondor (the way it works is in the name itself)
+    depends_on: List[str] = Field(default_factory=list)
     
     #execution results
     exit_code: Optional[int] = None
     stdout: Optional[str] = None
     stderr: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    #for job scheduling
+    submitter_id: str = "default_user"
+    user_priority: int = 0 #lower number means higher priority
+    expected_runtime: int = 3600 #in seconds, for backfilling
     
 class Worker(BaseModel):
     worker_id:str = Field(default_factory=lambda: str(uuid.uuid4()))

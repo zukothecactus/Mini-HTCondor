@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.responses import FileResponse
+from pathlib import Path
 from typing import Dict, Optional
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -7,13 +9,17 @@ import uvicorn
 import asyncio
 import os
 import json
+import shutil
 
 from models import Job, Worker, JobStatus, WorkerStatus, JobUpdateRequest, HeartbeatRequest
 
 #collector, negotiator and scheduler
 
 LEASE_DURATION = 20  # seconds -> dead worker
-SPOOL_FILE = "spool.json"  # file to persist jobs and workers across restarts
+
+#spool dir for sandboxes
+SPOOL_DIR = Path("spool_files")
+SPOOL_DIR.mkdir(exist_ok=True)
 
 #in-memory storage for jobs and workers (adding info, but also match making)
 jobs: Dict[str, Job]= {}
@@ -169,23 +175,77 @@ def get_next_job(worker_id:str):
     if worker.status == WorkerStatus.DEAD:
         raise HTTPException(status_code=403, detail="Worker is marked as DEAD")
     
-    #ClassAd matching
-    for job in jobs.values():
-        if(job.status == JobStatus.QUEUED):
-            #checking resource requirements
-            if evaluate_classad(job, worker):
-                
-                job.status = JobStatus.ASSIGNED
-                job.assigned_worker_id = worker_id
-                
-                worker.offered_cpus_available -= job.required_cpus
-                worker.offered_ram_available -= job.required_ram
-                
-                if worker.offered_cpus_available == 0: 
-                    worker.status = WorkerStatus.BUSY
+    #Fair-Share matchmaking algorithm
+    user_usage = {}
+    for j in jobs.values():
+        if j.status in (JobStatus.ASSIGNED, JobStatus.RUNNING):
+            user = j.submitter_id
+            user_usage[user] = user_usage.get(user, 0) + j.required_cpus  # or j.required_ram, depending on the metric you want to use
+    
+    queued_jobs = [j for j in jobs.values() if j.status == JobStatus.QUEUED]
 
-                save_state()  # Persist the updated state to disk
-                return job
+    #sort the queued jobs
+    #primarily by submitter's current cluster usage (lower usage gets higher priority)
+    #secondarily by th eusers own job priority (lower number means higher priority)
+    #finally by job_creation time (FIFO fallback)
+    
+    queued_jobs.sort(key=lambda j: (
+        user_usage.get(j.submitter_id, 0), 
+        j.user_priority, 
+        j.created_at
+    ))
+    
+    #backfilling: if a job has an expected runtime that is shorter than the current time slot, it can be scheduled even if it is not the highest priority job.
+    shadow_job = None
+    
+    #ClassAd matching
+    for job in queued_jobs:
+        #DAG dependency check
+        dependencies_met = True
+        for parent_id in job.depends_on:
+            parent_job = jobs.get(parent_id)
+            if not parent_job or parent_job.status != JobStatus.COMPLETED:
+                dependencies_met = False
+                break
+        
+        if not dependencies_met:
+            continue  # Skip this job if dependencies are not met
+        
+        #checking resource requirements (regardless of priority or backfilling)
+        if not evaluate_classad(job, worker):
+            continue  # Skip this job if requirements are not met
+        
+        can_fit_eventually = (job.required_cpus <= worker.offered_cpus_total and job.required_ram <= worker.offered_ram_total)
+        can_run_now = (job.required_cpus <= worker.offered_cpus_available and job.required_ram <= worker.offered_ram_available)
+
+
+        if can_fit_eventually:
+            
+            #first job we find that can eventually fit is our top priority for this worker 
+            #the 1st job that passes will also be the biggest one with the highest priority that is offered (sorting)
+            if not shadow_job:
+                shadow_job = job
+            
+            if can_run_now:
+                is_top_job = (job.job_id == shadow_job.job_id)
+            
+                #if its not the top job, we're backfilling
+                #we only allow short jobs to run
+                if not is_top_job and job.estimated_runtime > 600:
+                    continue  # Skip the long job (would starve the shadow job otherwise)
+                
+            #assign the job
+            job.status = JobStatus.ASSIGNED
+            job.assigned_worker_id = worker_id
+            
+            worker.offered_cpus_available -= job.required_cpus
+            worker.offered_ram_available -= job.required_ram
+            
+            if worker.offered_cpus_available == 0: 
+                worker.status = WorkerStatus.BUSY
+
+            save_state()  # Persist the updated state to disk
+            return job
     
     return None #no jobs available
 
@@ -200,7 +260,7 @@ def update_job(
     
     job = jobs[job_id]
     
-    #checking if this is the 1st timethe job is being marked as COMPLETED or FAILED (to avoid double counting)
+    #checking if this is the 1st time  the job is being marked as COMPLETED or FAILED (to avoid double counting)
     is_newly_finished = (job.status not in [JobStatus.COMPLETED, JobStatus.FAILED]) and (update_req.status in [JobStatus.COMPLETED, JobStatus.FAILED])
     
     #updating the state
@@ -212,6 +272,12 @@ def update_job(
         job.stdout = update_req.stdout
     if update_req.stderr is not None:
         job.stderr = update_req.stderr
+        
+    if update_req.status == JobStatus.FAILED:
+        for child_job in jobs.values():
+            if job_id in child_job.depends_on: #if the failed job is a parent of another job, we mark it as HELD (cant run till the parent is fixed)
+                child_job.status = JobStatus.HELD
+                print(f"[MASTER] Job {child_job.job_id} HELD due to parent {job_id} failure.")        
         
     # 3. Only restore resources if the transition actually happened just now
     if is_newly_finished:
@@ -228,6 +294,36 @@ def update_job(
            
     save_state()  # Persist the updated state to disk
     return job
+
+
+#file sandboxing endpoints
+@app.post("/jobs/{job_id}/input")
+async def upload_job_input(job_id: str, file: UploadFile = File(...)):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    file_path = SPOOL_DIR / f"{job_id}_in.tar.gz"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    jobs[job_id].has_input_sandbox = True
+    save_state()  # Persist the updated state to disk
+    return {"message": "Input files uploaded successfully."}
+
+@app.get("/jobs/{job_id}/input")
+def download_job_input(job_id: str):
+    file_path = SPOOL_DIR / f"{job_id}_in.tar.gz"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Input sandbox not found")
+    return FileResponse(file_path, media_type='application/gzip', filename=f"{job_id}_in.tar.gz")
+     
+@app.post("/jobs/{job_id}/output")
+async def upload_job_output(job_id: str, file: UploadFile = File(...)):
+    file_path = SPOOL_DIR / f"{job_id}_out.tar.gz"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    jobs[job_id].has_output_sandbox = True
+    save_state()  # Persist the updated state to disk
+    return {"message": "Output files uploaded successfully."}
 
 if __name__ == "__main__":
     uvicorn.run('master:app', host="0.0.0.0", port=8000, reload=True)
