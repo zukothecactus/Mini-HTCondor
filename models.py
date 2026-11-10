@@ -55,7 +55,7 @@ class Job(BaseModel):
     #for job scheduling
     submitter_id: str = "default_user"
     user_priority: int = 0 #lower number means higher priority
-    expected_runtime: int = 3600 #in seconds, for backfilling
+    estimated_runtime: int = 3600 #in seconds, for backfilling
     
 class Worker(BaseModel):
     worker_id:str = Field(default_factory=lambda: str(uuid.uuid4()))

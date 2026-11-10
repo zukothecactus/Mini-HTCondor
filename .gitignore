@@ -1,10 +1,29 @@
-# Python-generated files
+# Python bytecode
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.py[cod]
+*$py.class
 
-# Virtual environments
-.venv
+# Environments (uv / pip)
+.venv/
+venv/
+env/
+
+# IDEs and OS
+.vscode/
+.idea/
+__pycache__/
+.DS_Store
+Thumbs.db
+
+# Mini-HTCondor: Master node state and file sandboxing
+spool_files/
+*.tar.gz
+
+# Mini-HTCondor: Worker node execution environments
+worker_workspaces/
+
+# Datasets and local test outputs
+shared_cvmfs_data/
+*.root
+results.json
+results_cvmfs.txt

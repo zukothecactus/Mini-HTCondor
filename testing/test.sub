@@ -1,0 +1,19 @@
+# test.sub
+# This simulates a computational physics workload using Python
+docker_image = python:3.10-slim
+executable = python
+arguments = script.py
+
+request_cpus = 2.0
+request_memory = 1024.0
+estimated_runtime = 300
+
+# Custom Matchmaking: Require a worker with CVMFS attributes
+requirements = worker.offered_cpus_available >= job.required_cpus and worker.custom_attributes.get('has_cvmfs', False) == True
+
+# Files to ship over the network
+transfer_input_files = script.py
+transfer_output_files = true
+
+# Submit 5 identical instances 
+Queue 5

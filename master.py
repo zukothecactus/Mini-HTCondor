@@ -20,6 +20,7 @@ LEASE_DURATION = 20  # seconds -> dead worker
 #spool dir for sandboxes
 SPOOL_DIR = Path("spool_files")
 SPOOL_DIR.mkdir(exist_ok=True)
+SPOOL_FILE = SPOOL_DIR / "spool.json"  # File to persist job state
 
 #in-memory storage for jobs and workers (adding info, but also match making)
 jobs: Dict[str, Job]= {}
@@ -239,7 +240,7 @@ def get_next_job(worker_id:str):
             job.assigned_worker_id = worker_id
             
             worker.offered_cpus_available -= job.required_cpus
-            worker.offered_ram_available -= job.required_ram
+            worker.offered_ram_available -= int(job.required_ram)
             
             if worker.offered_cpus_available == 0: 
                 worker.status = WorkerStatus.BUSY
@@ -285,7 +286,7 @@ def update_job(
             w = workers[job.assigned_worker_id]
             #restoring the master node capacity for the worker (with a min() clamp, just in case)
             w.offered_cpus_available = min(w.offered_cpus_total, w.offered_cpus_available + job.required_cpus)
-            w.offered_ram_available = min(w.offered_ram_total, w.offered_ram_available + job.required_ram)
+            w.offered_ram_available = min(w.offered_ram_total, w.offered_ram_available + int(job.required_ram))
             
             # For dynamic multi-tenancy, a worker is only IDLE if it has 100% of its resources free.
             # Otherwise, it remains BUSY (partially occupied).

@@ -1,0 +1,15 @@
+docker_image = python:3.10-slim
+executable = python
+arguments = script_cvmfs.py
+
+request_cpus = 1.0
+request_memory = 512.0
+estimated_runtime = 300
+
+# STRICT MATCHMAKING: Must have CVMFS and the specific dataset
+requirements = worker.custom_attributes.get('has_cvmfs') == True and 'Run2012BC_DoubleMuParked_Muons' in worker.custom_attributes.get('cached_datasets', [])
+
+transfer_input_files = script_cvmfs.py
+transfer_output_files = true
+
+Queue 1
