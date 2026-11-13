@@ -1,0 +1,18 @@
+docker_image = python:3.10-slim
+
+# Clean standard syntax (no 'exec' prefix needed here anymore)
+executable = python
+arguments = script_checkpoint.py
+
+request_cpus = 1.0
+request_memory = 512.0
+
+# Force an eviction after 8 seconds to test checkpointing & self-healing
+estimated_runtime = 8
+
+checkpoint_file = checkpoint.json
+
+transfer_input_files = script_checkpoint.py
+transfer_output_files = true
+
+Queue 1

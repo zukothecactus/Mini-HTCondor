@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi import FastAPI, HTTPException, File, UploadFile, WebSocket, WebSocketDisconnect, websockets
 from fastapi.responses import FileResponse
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -25,6 +25,21 @@ SPOOL_FILE = SPOOL_DIR / "spool.json"  # File to persist job state
 #in-memory storage for jobs and workers (adding info, but also match making)
 jobs: Dict[str, Job]= {}
 workers: Dict[str, Worker] = {}
+
+#WebSocket control channels from workers: {worker_id: WebSocket}
+worker_control_sockets: Dict[str, WebSocket] = {}
+
+#log streaming queues per job {job_id: Set[asyncio.Queue]}
+'''this is the structure
+{
+    "job-123": {queue_a, queue_b},
+    "job-456": {queue_c}
+}
+'''
+
+job_log_subscribers: Dict[str, Set[asyncio.Queue]] = {}
+
+
 
 def evaluate_classad(job: Job, worker: Worker) -> bool:
     """Evaluates a job's requirement string against worker attributes."""
@@ -307,6 +322,8 @@ async def upload_job_input(job_id: str, file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
         
     jobs[job_id].has_input_sandbox = True
+    if jobs[job_id].status == JobStatus.SPOOLING:
+        jobs[job_id].status = JobStatus.QUEUED  # Move to QUEUED if it was waiting for input files
     save_state()  # Persist the updated state to disk
     return {"message": "Input files uploaded successfully."}
 
@@ -325,6 +342,155 @@ async def upload_job_output(job_id: str, file: UploadFile = File(...)):
     jobs[job_id].has_output_sandbox = True
     save_state()  # Persist the updated state to disk
     return {"message": "Output files uploaded successfully."}
+
+#job checkpointing endpoints
+@app.post("/jobs/{job_id}/checkpoint")
+async def upload_job_checkpoint(job_id: str, file: UploadFile = File(...)):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    file_path = SPOOL_DIR / f"{job_id}_checkpoint.tar.gz"
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    jobs[job_id].has_checkpoint = True
+    save_state()  # Persist the updated state to disk
+    return {"message": "Checkpoint files uploaded successfully."}
+
+@app.get("/jobs/{job_id}/checkpoint")
+def download_job_checkpoint(job_id: str):
+    file_path = SPOOL_DIR / f"{job_id}_checkpoint.tar.gz"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Checkpoint sandbox not found")
+    return FileResponse(file_path, media_type='application/gzip', filename=f"{job_id}_checkpoint.tar.gz")
+
+
+#condor_tail (log streaming) endpoints-------------------------------------------
+'''
+Worker --------------------> Master
+        log-ingest websocket
+
+Worker <-------------------- Master
+        control websocket
+
+Client <-------------------- Master
+        tail/log websocket
+'''
+#opening a WS for every worker
+@app.websocket("/ws/worker/{worker_id}")
+async def worker_control_es(websocket: WebSocket, worker_id:str):
+    '''perisistant WebSocket control channel for each worker (outbound)'''
+    await websocket.accept()
+    worker_control_sockets[worker_id] = websocket
+    print(f"[MASTER] Control WebSocket registered for {worker_id}")
+    
+    try:
+        while True:
+            raw = await websocket.receive_text()  # Keep the connection alive
+            msg = json.loads(raw)
+            msg_type = msg.get("type")
+            job_id = msg.get("job_id")
+            
+            if msg_type == "log_chunk" and job_id:
+                chunk = msg.get("data", "")
+                for q in list(job_log_subscribers.get(job_id, [])):
+                    await q.put(chunk)
+            elif msg_type == "log_stream_end" and job_id:
+                for q in list(job_log_subscribers.get(job_id, [])):
+                    await q.put(None)  # None signals EOF
+    except WebSocketDisconnect:
+        print(f"[MASTER] Control WebSocket disconnected for {worker_id}")
+    finally:
+        if worker_control_sockets.get(worker_id) == websocket:
+            del worker_control_sockets[worker_id]
+        # Unblock any CLI clients tailing jobs on a worker that just disconnected
+        for j_id, job in jobs.items():
+            if job.assigned_worker_id == worker_id and j_id in job_log_subscribers:
+                for q in list(job_log_subscribers[j_id]):
+                    await q.put(f"\n[MASTER] Lost connection to worker {worker_id}.\n")
+                    await q.put(None)  # Signal EOF to all subscribers
+
+@app.websocket("/ws/jobs/{job_id}/stream")
+async def client_tail_ws(websocket: WebSocket, job_id:str):
+    """Client endpoint for `submit.py --tail <job_id>`."""
+    await websocket.accept()
+
+    if job_id not in jobs:
+        await websocket.send_text(f"[MASTER] Error: Job {job_id} not found.\n")
+        await websocket.close(code=1008) #policy violation (invalid job_id)
+        return
+
+    job = jobs[job_id]
+
+    # if the job is already finished, flush stored logs immediately
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        await websocket.send_text(f"[MASTER] Job {job_id} already {job.status.value}. Dumping logs:\n") 
+        if job.stdout:
+            await websocket.send_text(job.stdout)
+        if job.stderr:
+            await websocket.send_text(f"\n--- STDERR ---\n{job.stderr}")
+        await websocket.close(code=1000) #normal closure
+        return
+
+    # 2. Wait if the job is still QUEUED or ASSIGNED
+    if job.status in (JobStatus.QUEUED, JobStatus.ASSIGNED):
+        await websocket.send_text(f"[MASTER] Job {job_id} is {job.status.value}. Waiting for execution...\n")
+        while job.status in (JobStatus.QUEUED, JobStatus.ASSIGNED):
+            await asyncio.sleep(0.5) #asyncio sleep to avoid blocking the fastapi event loop. Sleep to avoid busy waiting and allow other tasks to run
+
+    # Re-check in case it failed immediately upon startup, dump logs immidiately if so
+    if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        if job.stdout:
+            await websocket.send_text(job.stdout)
+        if job.stderr:
+            await websocket.send_text(f"\n--- STDERR ---\n{job.stderr}")
+        await websocket.close(code=1000)
+        return
+
+    #the job is running now -> tail the logs
+    #finding the worker that is running the job and its control channel (through which we talk with the worker)
+    worker_id = job.assigned_worker_id
+    control_ws = worker_control_sockets.get(worker_id)
+    if not control_ws:
+        await websocket.send_text(f"[MASTER] Worker {worker_id} does not have an active control channel.\n")
+        await websocket.close(code=1011)
+        return
+
+    # 3. Register subscriber queue and instruct the Worker to start streaming
+    queue: asyncio.Queue = asyncio.Queue()
+    job_log_subscribers.setdefault(job_id, set()).add(queue)
+    #master to worker
+    await control_ws.send_json({
+        "action": "start_tail", 
+        "job_id": job_id
+    })
+
+    try:
+        while True:
+            chunk = await queue.get() #receive log chunk from the worker's log ingest websocket
+            if chunk is None:  # Worker closed log stream (container exited)
+                break
+            await websocket.send_text(chunk) #forward the log chunk to the client
+    except WebSocketDisconnect:
+        pass
+    finally:
+        subs = job_log_subscribers.get(job_id) #get the set of queues subscribed to this job's logs
+        if subs:
+            subs.discard(queue) #remove this client's queue from the set of subscribers
+            # Stop worker stream only if no other clients are tailing this job
+            if not subs:
+                del job_log_subscribers[job_id]
+                if worker_id in worker_control_sockets:
+                    try:
+                        await worker_control_sockets[worker_id].send_json({
+                            "action": "stop_tail", 
+                             "job_id": job_id
+                        })
+                    except Exception:
+                        pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     uvicorn.run('master:app', host="0.0.0.0", port=8000, reload=True)

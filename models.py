@@ -12,6 +12,7 @@ class JobStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     HELD = "HELD" #if a job exceeds the max_retries
+    SPOOLING = "SPOOLING"  # Awaiting input sandbox upload before entering the queue
 class WorkerStatus(str, Enum):
     IDLE = "IDLE"
     BUSY = "BUSY"
@@ -41,6 +42,10 @@ class Job(BaseModel):
     #file sandboxing flags
     has_input_sandbox: bool = False
     has_output_sandbox: bool = False
+    
+    #checkpointing flags
+    has_checkpoint: bool = False
+    checkpoint_file: str = "" #what the worker should look for on eviction
     
     #Mini-DAGMan: list of parent job_ids that must be completed before this job can run
     #DAGMan: Directed Acyclic Graph Manager, a meta-scheduler for HTCondor (the way it works is in the name itself)

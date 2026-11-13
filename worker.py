@@ -7,9 +7,13 @@ import tempfile
 import tarfile
 import os
 import shutil
+import json
+from websockets.sync.client import connect as ws_connect
 from typing import Dict, Any
 
 MASTER_URL = "http://localhost:8000"
+WS_MASTER_URL = MASTER_URL.replace("http://", "ws://").replace("https://", "wss://")
+
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"  # Unique identifier for this worker
 HEARTBEAT_INTERVAL = 5  # seconds
 
@@ -28,6 +32,79 @@ except docker.errors.DockerException:
 active_jobs_lock = threading.Lock()
 active_jobs_count = 0
 
+active_containers: Dict[str, Any] = {}
+active_containers_lock = threading.Lock()
+tail_stop_events: Dict[str, threading.Event] = {}
+
+active_control_ws = None
+control_ws_lock = threading.Lock()
+
+def send_control_json(payload:dict):
+    with control_ws_lock:
+        if active_control_ws is not None:
+            active_control_ws.send(json.dumps(payload))
+
+def stream_container_logs(job_id: str, stop_event: threading.Event):
+    """Reads Docker log stream and multiplexes chunks over the control WebSocket."""
+    with active_containers_lock:
+        container = active_containers.get(job_id)
+
+    if not container:
+        try:
+            send_control_json({"type": "log_eof", "job_id": job_id})
+        except Exception:
+            pass
+        tail_stop_events.pop(job_id, None)
+        return
+
+    try:
+        for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
+            if stop_event.is_set():
+                break
+            send_control_json({
+                "type": "log_chunk",
+                "job_id": job_id,
+                "data": chunk.decode("utf-8", errors="replace")
+            })
+    except Exception as e:
+        print(f"[{WORKER_ID}] Log stream ended for job {job_id}: {e}")
+    finally:
+        try:
+            send_control_json({"type": "log_eof", "job_id": job_id})
+        except Exception:
+            pass
+        tail_stop_events.pop(job_id, None)
+
+def control_channel_daemon():
+    """listens for control messages from the master (e.g., to stop a running job)"""
+    global active_control_ws
+    while True:
+       try:
+           with ws_connect(f"{WS_MASTER_URL}/ws/worker/{WORKER_ID}") as ws:
+                with control_ws_lock:
+                    active_control_ws = ws
+                print(f"[{WORKER_ID}] Connected to Master control WebSocket.")
+                while True:
+                    raw_message = ws.recv()
+                    message = json.loads(raw_message)
+                    action = message.get("action")
+                    job_id = message.get("job_id")
+                    
+                    if action == "start_tail" and job_id not in tail_stop_events:
+                        stop_event = threading.Event()
+                        tail_stop_events[job_id] = stop_event
+                        threading.Thread(
+                            target=stream_container_logs, 
+                            args=(job_id, stop_event), 
+                            daemon=True
+                        ).start()
+                    elif action == "stop_tail" and job_id in tail_stop_events:
+                        tail_stop_events[job_id].set()
+       except Exception:
+           with control_ws_lock:
+                active_control_ws = None
+           time.sleep(3) #reconect delay if the master is down or the connection drops
+    
 def get_worker_status() -> str:
     #determine status based on running threads (active jobs)
     with active_jobs_lock:
@@ -100,9 +177,8 @@ def execute_job_thread(job: Dict[str, Any]):
     try:
         #so that the image exists locally
         docker_client.images.pull(image)
-        docker_client.images.pull(image)
         
-        # Create a local directory within the project folder that Docker can easily mount
+        #local directory within the project folder that Docker can easily mount
         workspace_dir = os.path.abspath(f"./worker_workspaces/{job_id}")
         os.makedirs(workspace_dir, exist_ok=True)
         
@@ -122,6 +198,20 @@ def execute_job_thread(job: Dict[str, Any]):
                         tar.extractall(path=workspace_dir)
                     os.remove(tar_path)
             
+            
+            #download the checkpoint file if it exists
+            if job.get("has_checkpoint"):
+                print(f"[{WORKER_ID}] Downloading checkpoint for {job_id}...")
+                resp = requests.get(f"{MASTER_URL}/jobs/{job_id}/checkpoint", stream=True)
+                if resp.status_code == 200:
+                    checkpoint_tar_path = os.path.join(workspace_dir, "checkpoint.tar.gz")
+                    with open(checkpoint_tar_path, "wb") as buffer:
+                        for chunk in resp.iter_content(chunk_size = 8192):
+                            buffer.write(chunk)
+                    with tarfile.open(checkpoint_tar_path, "r:gz") as tar:
+                        tar.extractall(path=workspace_dir)
+                    os.remove(checkpoint_tar_path)
+                
             # dynamically build the volume mount dictionary
             volumes_dict = {workspace_dir: {'bind': '/workspace', 'mode': 'rw'}}
             for host_path, guest_path in LOCAL_DATASET.items():
@@ -130,18 +220,26 @@ def execute_job_thread(job: Dict[str, Any]):
                 else:
                     print(f"[{WORKER_ID}] Warning: Local dataset path '{host_path}' does not exist. Skipping mount.")
         
+            '''passing a raw string command to Docker runs it inside shell invocation mode (/bin/sh -c). The shell process becomes PID 1 inside the container. When Docker issues a SIGTERM, POSIX shells ignore signals for child processes by default, causing SIGTERM to be swallowed and resulting in hard SIGKILL eviction without checkpointing. Passing "exec python script.py" directly fails because exec is a shell builtin, not a binary in $PATH.'''
             # run the container detached
             print(f"[{WORKER_ID}] Executing: {command} in sandboxed environment.")
             container = docker_client.containers.run(
-                image = image, 
-                command = command,
+                image = image,
+                command = ["/bin/sh", "-c", f"exec {command}"],
                 nano_cpus = nano_cpus,
                 mem_limit = mem_limit, 
                 volumes = volumes_dict,
                 working_dir = '/workspace',
+                environment = {"PYTHONUNBUFFERED": "1"},  # Ensures Python output is unbuffered
                 detach=True
             )
+            #without pythonunbuffered, pyhton inside a non-tty docker container (not configured to act like an interactive terminal) will buffer stdout and stderr  (default to 4kb block buffering), causing the worker to not see any output until the buffer is flushed (which may be at the end of execution). This is especially problematic for long-running jobs that produce output incrementally.
+            
+            
         
+            with active_containers_lock:
+                active_containers[job_id] = container
+            update_job(job_id, status="RUNNING")
             start_time = time.time()
             grace_period = 10
             runtime_limit = job.get("estimated_runtime", 3600)
@@ -171,6 +269,22 @@ def execute_job_thread(job: Dict[str, Any]):
                 
             container.remove()
             
+            #upload the checkpoint upon eviction
+            checkpoint_target = job.get("checkpoint_file", "")
+            if evicted and checkpoint_target:
+                checkpoint_path = os.path.join(workspace_dir, checkpoint_target)
+                if os.path.exists(checkpoint_path):
+                    print (f"[{WORKER_ID}] Found checkpoint file. Uploading checkpoint for {job_id}...")
+                    checkpoint_tar_path = os.path.join(workspace_dir, "checkpoint.tar.gz")
+                    with tarfile.open(checkpoint_tar_path, "w:gz") as tar:
+                        tar.add(checkpoint_path, arcname=checkpoint_target)
+                        
+                    with open(checkpoint_tar_path, "rb") as f:
+                        requests.post(
+                            f"{MASTER_URL}/jobs/{job_id}/checkpoint",
+                            files={"file": ("checkpoint.tar.gz", f, "application/gzip")}
+                        )
+            
             if job.get("has_output_sandbox"):
                 print(f"[{WORKER_ID}] Uploading output sandbox for {job_id}...")
                 out_tar_path = os.path.join(workspace_dir, "output.tar.gz")
@@ -189,6 +303,10 @@ def execute_job_thread(job: Dict[str, Any]):
             update_job(job_id, status=final_status, exit_code=exit_code, stdout=stdout, stderr=stderr)
             
         finally:
+            with active_containers_lock:
+                active_containers.pop(job_id, None)
+            if job_id in tail_stop_events:
+                tail_stop_events[job_id].set()
             # Clean up the physical directory after the job completes or fails
             shutil.rmtree(workspace_dir, ignore_errors=True)
             
@@ -208,6 +326,8 @@ def run_worker():
     
     hb_thread = threading.Thread(target=heartbeat_daemon, daemon=True)
     hb_thread.start()
+    ctrl_thread = threading.Thread(target=control_channel_daemon, daemon=True)
+    ctrl_thread.start()
     
     while True:
         job = fetch_job()
